@@ -8,3 +8,4 @@ opencv-python-headless>=4.8.0
 aiohttp
 av
 opencv-python
+face_recognition

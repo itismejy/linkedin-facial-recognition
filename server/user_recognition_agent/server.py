@@ -32,6 +32,74 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+import face_recognition
+
+# ---------------------------------------------------------------------------
+# Face Recognition Setup
+# ---------------------------------------------------------------------------
+KNOWN_FACES_DIR = Path(__file__).resolve().parent / "known_faces"
+KNOWN_FACE_ENCODINGS = []
+KNOWN_FACE_NAMES = []
+
+def load_known_faces():
+    """Load reference images from known_faces directory to use in face recognition."""
+    KNOWN_FACES_DIR.mkdir(parents=True, exist_ok=True)
+    log.info(f"Loading known faces from {KNOWN_FACES_DIR} ...")
+    loaded_count = 0
+    for filename in os.listdir(KNOWN_FACES_DIR):
+        if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
+            filepath = KNOWN_FACES_DIR / filename
+            name = os.path.splitext(filename)[0]
+            try:
+                img = face_recognition.load_image_file(str(filepath))
+                encodings = face_recognition.face_encodings(img)
+                if encodings:
+                    KNOWN_FACE_ENCODINGS.append(encodings[0])
+                    KNOWN_FACE_NAMES.append(name)
+                    loaded_count += 1
+                    log.info(f"Loaded known face: {name}")
+                else:
+                    log.warning(f"No face found in {filename}")
+            except Exception as e:
+                log.warning(f"Error loading {filename}: {e}")
+    log.info(f"Finished loading {loaded_count} known faces.")
+
+def run_face_recognition_sync(bgr_frame: np.ndarray) -> list[str]:
+    """
+    Run face recognition synchronously on a BGR frame.
+    Returns a list of names for recognized faces.
+    """
+    if not KNOWN_FACE_ENCODINGS:
+        return []
+
+    # Convert BGR (OpenCV) to RGB (face_recognition)
+    rgb_frame = bgr_frame[:, :, ::-1]
+    
+    # Optional: resize for faster processing
+    small_frame = cv2.resize(rgb_frame, (0, 0), fx=0.5, fy=0.5)
+
+    locations = face_recognition.face_locations(small_frame)
+    if not locations:
+        return []
+
+    encodings = face_recognition.face_encodings(small_frame, locations)
+    
+    names_found = []
+    for encoding in encodings:
+        matches = face_recognition.compare_faces(KNOWN_FACE_ENCODINGS, encoding, tolerance=0.6)
+        name = "Unknown"
+        
+        # Or use face_distance to find the best match
+        face_distances = face_recognition.face_distance(KNOWN_FACE_ENCODINGS, encoding)
+        best_match_index = np.argmin(face_distances)
+        if matches[best_match_index]:
+            name = KNOWN_FACE_NAMES[best_match_index]
+            
+        names_found.append(name)
+    
+    return names_found
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -535,7 +603,7 @@ def write_h264_audio_clip(
                     pass
 
 
-async def bridge(glasses_ws: websockets.ServerConnection) -> None:
+async def bridge(glasses_ws) -> None:
     """
     Non-assistant mode: receive H.264 video (0x03) and audio from client,
     buffer them, and every VIDEO_CLIP_SECONDS write a combined MP4.
@@ -607,28 +675,55 @@ async def bridge(glasses_ws: websockets.ServerConnection) -> None:
 
     save_task: Optional[asyncio.Task] = None
     sender_task: Optional[asyncio.Task] = None
+    
+    import av
+    import json
+
+    h264_codec = None
+    try:
+        h264_codec = av.CodecContext.create("h264", "r")
+    except Exception as e:
+        log.warning("Could not create PyAV H264 codec: %s", e)
+
+    face_rec_codec = None
+    face_rec_codec_ready = False
+
+    last_face_rec_time = 0
+    FACE_REC_INTERVAL_SEC = 2.0
+
+    FUN_FACTS = {
+        "Maryam": "I have snesthesia, i can see colors when hearing naems and numbers.",
+        "Kaleb": "Threw javelin in college.",
+        "Jason": "my favorite movie is interstellar",
+        "jason": "my favorite movie is interstellar"
+    }
+
+    async def process_face_frame(bgr_frame: np.ndarray) -> None:
+        try:
+            names = await loop.run_in_executor(None, run_face_recognition_sync, bgr_frame)
+            if names:
+                known_names = [n for n in names if n != "Unknown"]
+                if known_names:
+                    display_texts = []
+                    for n in known_names:
+                        fact = FUN_FACTS.get(n) or FUN_FACTS.get(n.lower()) or FUN_FACTS.get(n.capitalize())
+                        if fact:
+                            display_texts.append(f"{n} - {fact}")
+                        else:
+                            display_texts.append(n)
+                            
+                    msg = f"Detected: {', '.join(display_texts)}"
+                    payload = {
+                        "type": "face_detection",
+                        "message": msg,
+                        "timestamp": time.time()
+                    }
+                    await glasses_ws.send(json.dumps(payload))
+                    log.info(f"======== FACE RECOGNIZED: {msg} ========")
+        except Exception as e:
+            log.warning("process_face_frame failed: %s", e)
     try:
         save_task = asyncio.create_task(save_clip_every_interval())
-
-        async def mock_data_sender() -> None:
-            """Periodically send mock JSON data to the glasses."""
-            import json
-            count = 0
-            while True:
-                await asyncio.sleep(2.0)
-                count += 1
-                payload = {
-                    "type": "mock_data",
-                    "message": f"Hello from server! This is message #{count}",
-                    "timestamp": time.time()
-                }
-                try:
-                    await glasses_ws.send(json.dumps(payload))
-                except Exception as e:
-                    log.warning("mock_data_sender failed: %s", e)
-                    break
-                    
-        sender_task = asyncio.create_task(mock_data_sender())
 
         async for message in glasses_ws:
             if isinstance(message, bytes) and len(message) >= 1:
@@ -654,6 +749,35 @@ async def bridge(glasses_ws: websockets.ServerConnection) -> None:
                         if h264_config is None:
                             h264_config = payload
                         h264_buffer.append(payload)
+
+                    if KNOWN_FACE_ENCODINGS:
+                        if not face_rec_codec_ready and h264_config is not None:
+                            try:
+                                face_rec_codec = av.CodecContext.create("h264", "r")
+                                for pkt in face_rec_codec.parse(h264_config):
+                                    face_rec_codec.decode(pkt)
+                                face_rec_codec_ready = True
+                                log.info("[face_rec] Codec initialized with SPS/PPS (%d bytes)", len(h264_config))
+                            except Exception as e:
+                                log.warning("[face_rec] Codec init failed: %s", e)
+
+                        if face_rec_codec_ready and face_rec_codec is not None:
+                            try:
+                                for pkt in face_rec_codec.parse(payload):
+                                    for frame in face_rec_codec.decode(pkt):
+                                        now = time.monotonic()
+                                        if now - last_face_rec_time >= FACE_REC_INTERVAL_SEC:
+                                            last_face_rec_time = now
+                                            bgr_img = frame.to_ndarray(format='bgr24')
+                                            bgr_img = cv2.rotate(bgr_img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                                            INTERMEDIATE_DATA_DIR.mkdir(parents=True, exist_ok=True)
+                                            snap_ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+                                            snap_path = INTERMEDIATE_DATA_DIR / f"face_frame_{snap_ts}.jpg"
+                                            cv2.imwrite(str(snap_path), bgr_img)
+                                            log.info("[face_rec] Decoded frame %dx%d, saved to %s, running recognition", bgr_img.shape[1], bgr_img.shape[0], snap_path.name)
+                                            asyncio.create_task(process_face_frame(bgr_img))
+                            except Exception as e:
+                                log.warning("[face_rec] decode error: %s", e)
                 else:
                     log.debug("[stream_only] unknown frame_type=0x%02x len=%d", frame_type, len(payload))
             now = time.monotonic()
@@ -691,6 +815,7 @@ async def bridge(glasses_ws: websockets.ServerConnection) -> None:
 
 async def main() -> None:
     ensure_only_video_clips_in_intermediate_data()
+    load_known_faces()
     log.info("Starting WebSocket server on ws://%s:%d (user recognition - stream only)", HOST, PORT)
     log.info("Starting HTTP upload server on http://%s:%d/upload_clip", HOST, UPLOAD_PORT)
 
@@ -724,7 +849,7 @@ async def main() -> None:
     await runner.setup()
     site = web.TCPSite(runner, HOST, UPLOAD_PORT)
 
-    async def ws_handler(ws: websockets.ServerConnection) -> None:
+    async def ws_handler(ws) -> None:
         await bridge(ws)
 
     ws_server = await websockets.serve(ws_handler, HOST, PORT)
