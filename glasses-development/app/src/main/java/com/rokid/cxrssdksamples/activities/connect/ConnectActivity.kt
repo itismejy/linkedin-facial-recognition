@@ -54,10 +54,12 @@ class ConnectActivity : ComponentActivity() {
             CXRSSDKSamplesTheme(darkTheme = true) {
                 val connectionState by viewModel.connectionState.collectAsState()
                 val statusMessage by viewModel.statusMessage.collectAsState()
+                val serverMessage by viewModel.serverMessage.collectAsState()
 
                 ConnectScreen(
                     connectionState = connectionState,
                     statusMessage = statusMessage,
+                    serverMessage = serverMessage,
                     onConnectClick = { handleConnectClick() },
                     onDisconnectClick = { viewModel.disconnect() }
                 )
@@ -84,6 +86,7 @@ class ConnectActivity : ComponentActivity() {
 fun ConnectScreen(
     connectionState: ConnectionState,
     statusMessage: String,
+    serverMessage: String,
     onConnectClick: () -> Unit,
     onDisconnectClick: () -> Unit,
 ) {
@@ -124,6 +127,22 @@ fun ConnectScreen(
         )
 
         Spacer(modifier = Modifier.height(32.dp))
+
+        if (serverMessage.isNotEmpty()) {
+            Text(
+                text = serverMessage,
+                color = Color.Cyan,
+                fontSize = 24.sp,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color.DarkGray, shape = RoundedCornerShape(8.dp))
+                    .padding(16.dp)
+            )
+
+            Spacer(modifier = Modifier.height(32.dp))
+        }
 
         if (!isConnected) {
             ActionButton(

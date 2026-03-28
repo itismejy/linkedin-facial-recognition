@@ -606,8 +606,29 @@ async def bridge(glasses_ws: websockets.ServerConnection) -> None:
     STATS_INTERVAL = 2.0
 
     save_task: Optional[asyncio.Task] = None
+    sender_task: Optional[asyncio.Task] = None
     try:
         save_task = asyncio.create_task(save_clip_every_interval())
+
+        async def mock_data_sender() -> None:
+            """Periodically send mock JSON data to the glasses."""
+            import json
+            count = 0
+            while True:
+                await asyncio.sleep(2.0)
+                count += 1
+                payload = {
+                    "type": "mock_data",
+                    "message": f"Hello from server! This is message #{count}",
+                    "timestamp": time.time()
+                }
+                try:
+                    await glasses_ws.send(json.dumps(payload))
+                except Exception as e:
+                    log.warning("mock_data_sender failed: %s", e)
+                    break
+                    
+        sender_task = asyncio.create_task(mock_data_sender())
 
         async for message in glasses_ws:
             if isinstance(message, bytes) and len(message) >= 1:
@@ -657,6 +678,12 @@ async def bridge(glasses_ws: websockets.ServerConnection) -> None:
             save_task.cancel()
             try:
                 await save_task
+            except asyncio.CancelledError:
+                pass
+        if sender_task and not sender_task.done():
+            sender_task.cancel()
+            try:
+                await sender_task
             except asyncio.CancelledError:
                 pass
         log.info("Glasses disconnected: %s", client_addr)

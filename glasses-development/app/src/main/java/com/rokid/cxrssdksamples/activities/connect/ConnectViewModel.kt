@@ -66,6 +66,9 @@ class ConnectViewModel(application: Application) : AndroidViewModel(application)
     )
     val statusMessage = _statusMessage.asStateFlow()
 
+    private val _serverMessage = MutableStateFlow("")
+    val serverMessage = _serverMessage.asStateFlow()
+
     // ---------------------------------------------------------------------------
     // Audio constants — 16 kHz, 16-bit PCM, mono (matches Google Live API input)
     // ---------------------------------------------------------------------------
@@ -159,8 +162,16 @@ class ConnectViewModel(application: Application) : AndroidViewModel(application)
             }
 
             override fun onMessage(ws: WebSocket, text: String) {
-                // Text frame = JSON from the server — log it (UI layer can extend this)
+                // Text frame = JSON from the server
                 Log.i(TAG, "Server JSON: $text")
+                try {
+                    val json = org.json.JSONObject(text)
+                    if (json.has("message")) {
+                        _serverMessage.value = json.getString("message")
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to parse JSON: ${e.message}")
+                }
                 _statusMessage.value = "Connected • receiving data"
             }
 
@@ -561,6 +572,7 @@ class ConnectViewModel(application: Application) : AndroidViewModel(application)
 
         _connectionState.value = ConnectionState.DISCONNECTED
         _statusMessage.value = "Disconnected"
+        _serverMessage.value = ""
     }
 
     override fun onCleared() {
