@@ -170,7 +170,7 @@ All communication over a single persistent WebSocket connection.
 1. Receive `{"command": "enroll"}` text frame from glasses
 2. Grab the most recent decoded video frame → extract face embedding
 3. Grab the last ~10 seconds of buffered audio → transcribe with Whisper
-4. Extract name, role, fun_fact from transcription (regex or LLM prompt)
+4. Extract name, role, fun_fact from transcription via Google Gemini
 5. Store in SQLite: `(name, role, fun_fact, embedding, created_at)`
 6. Send `{"type": "enrolled", "person": {...}}` back to glasses
 7. If transcription fails, fall back: store embedding with `name="Unknown_N"`, allow manual edit later
@@ -253,10 +253,10 @@ CREATE TABLE persons (
 | Transport | WebSocket (OkHttp ↔ websockets lib) | Already built |
 | Tunnel | zrok | Already configured |
 | Backend | Python, websockets, aiohttp | Partially built |
-| Face detection | face_recognition (dlib) | pip install |
-| Face embeddings | face_recognition (128-dim) | Same lib |
+| Face detection | face_recognition (ageitgey/face_recognition) | pip install, dlib-based |
+| Face embeddings | face_recognition (128-dim) | Same lib, proven |
 | STT | OpenAI Whisper API | Fast, accurate |
-| Name extraction | GPT-4o-mini or regex | Parse intro text |
+| Name extraction | Google Gemini | Parse intro text |
 | Database | SQLite | Built-in, zero setup |
 | Video decode | OpenCV or ffmpeg (subprocess) | For H.264 → BGR |
 
@@ -308,11 +308,11 @@ CREATE TABLE persons (
 ### Person C — Backend (Kaleb)
 - Add face recognition to existing WebSocket handler
 - Decode H.264 → BGR frames inline
-- face_recognition for embeddings + matching
+- face_recognition (ageitgey/face_recognition) for embeddings + matching
 - SQLite persons table
 - Enrollment flow (frame + optional audio → store)
 - Send recognition JSON back to glasses
-- Stretch: Whisper + LLM for auto-enrollment from audio
+- Stretch: Whisper + Gemini for auto-enrollment from audio
 
 ---
 
