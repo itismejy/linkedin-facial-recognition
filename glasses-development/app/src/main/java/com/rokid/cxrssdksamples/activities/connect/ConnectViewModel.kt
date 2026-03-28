@@ -48,6 +48,7 @@ private const val FRAME_TYPE_AUDIO: Byte = 0x01       // PCM audio (for assistan
 private const val FRAME_TYPE_IMAGE: Byte = 0x02       // JPEG image
 private const val FRAME_TYPE_VIDEO_H264: Byte = 0x03  // H.264/AVC video
 private const val FRAME_TYPE_AUDIO_AAC: Byte = 0x04   // AAC-encoded audio (for stream-only recording)
+private const val FRAME_TYPE_AUDIO_POST_ALGORITHM: Byte = 0x05  // Post-algorithm PCM (ch 0/1)
 
 class ConnectViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -64,6 +65,9 @@ class ConnectViewModel(application: Application) : AndroidViewModel(application)
         "Ensure device has Wi‑Fi, then press Connect. All audio and video go to the server only (standalone)."
     )
     val statusMessage = _statusMessage.asStateFlow()
+
+    private val _serverMessage = MutableStateFlow("")
+    val serverMessage = _serverMessage.asStateFlow()
 
     // ---------------------------------------------------------------------------
     // Audio constants — 16 kHz, 16-bit PCM, mono (matches Google Live API input)
@@ -158,8 +162,16 @@ class ConnectViewModel(application: Application) : AndroidViewModel(application)
             }
 
             override fun onMessage(ws: WebSocket, text: String) {
-                // Text frame = JSON from the server — log it (UI layer can extend this)
+                // Text frame = JSON from the server
                 Log.i(TAG, "Server JSON: $text")
+                try {
+                    val json = org.json.JSONObject(text)
+                    if (json.has("message")) {
+                        _serverMessage.value = json.getString("message")
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to parse JSON: ${e.message}")
+                }
                 _statusMessage.value = "Connected • receiving data"
             }
 
@@ -358,7 +370,9 @@ class ConnectViewModel(application: Application) : AndroidViewModel(application)
 
         audioRecord?.startRecording()
 
-        // Read 8-channel PCM, extract channels 2,3,4,5 (raw mics), downmix to mono, feed into AAC encoder
+        // Read 8-channel PCM. Two streams:
+        // - Raw: channels 2/3/4/5 (4 mics) → mono → 0x01 + AAC 0x04
+        // - Post-algorithm: channels 0/1 (noise-suppressed) → mono → 0x05
         micJob = viewModelScope.launch(Dispatchers.IO) {
             val buffer = ShortArray(MIC_BUFFER * ROKID_TOTAL_CHANNELS)
             val rec = audioRecord ?: return@launch
@@ -366,24 +380,41 @@ class ConnectViewModel(application: Application) : AndroidViewModel(application)
                 val shortsRead = rec.read(buffer, 0, buffer.size)
                 if (shortsRead <= 0) continue
                 val framesRead = shortsRead / ROKID_TOTAL_CHANNELS
-                // Extract ch2, ch3, ch4, ch5 (raw microphones), average to mono
-                val mono = ByteArray(framesRead * 2) // 16-bit mono
+
+                val rawMono = ByteArray(framesRead * 2)   // raw: ch2,3,4,5 → mono
+                val postAlgMono = ByteArray(framesRead * 2) // post-algorithm: ch0,1 → mono
+
                 for (i in 0 until framesRead) {
                     val baseIdx = i * ROKID_TOTAL_CHANNELS
+                    
+                    // Post-algorithm (channels 0/1)
+                    val ch0 = buffer[baseIdx].toInt()
+                    val ch1 = buffer[baseIdx + 1].toInt()
+                    val postMixed = ((ch0 + ch1) / 2).toShort()
+                    postAlgMono[i * 2] = (postMixed.toInt() and 0xFF).toByte()
+                    postAlgMono[i * 2 + 1] = (postMixed.toInt() shr 8 and 0xFF).toByte()
+                    
+                    // Raw (channels 2,3,4,5)
                     val ch2 = buffer[baseIdx + 2].toInt()
                     val ch3 = buffer[baseIdx + 3].toInt()
                     val ch4 = buffer[baseIdx + 4].toInt()
                     val ch5 = buffer[baseIdx + 5].toInt()
-                    val mixed = ((ch2 + ch3 + ch4 + ch5) / 4).toShort()
-                    mono[i * 2] = (mixed.toInt() and 0xFF).toByte()
-                    mono[i * 2 + 1] = (mixed.toInt() shr 8 and 0xFF).toByte()
+                    val rawMixed = ((ch2 + ch3 + ch4 + ch5) / 4).toShort()
+                    rawMono[i * 2] = (rawMixed.toInt() and 0xFF).toByte()
+                    rawMono[i * 2 + 1] = (rawMixed.toInt() shr 8 and 0xFF).toByte()
                 }
 
-                // Send raw PCM (0x01) immediately for Gemini Assistant
-                val pcmFrame = ByteArray(mono.size + 1)
-                pcmFrame[0] = FRAME_TYPE_AUDIO
-                System.arraycopy(mono, 0, pcmFrame, 1, mono.size)
-                webSocketRef.get()?.send(pcmFrame.toByteString())
+                // Send raw PCM (0x01) immediately for Gemini Assistant / recording
+                val rawFrame = ByteArray(rawMono.size + 1)
+                rawFrame[0] = FRAME_TYPE_AUDIO
+                System.arraycopy(rawMono, 0, rawFrame, 1, rawMono.size)
+                webSocketRef.get()?.send(rawFrame.toByteString())
+
+                // Send post-algorithm PCM (0x05)
+                val postAlgFrame = ByteArray(postAlgMono.size + 1)
+                postAlgFrame[0] = FRAME_TYPE_AUDIO_POST_ALGORITHM
+                System.arraycopy(postAlgMono, 0, postAlgFrame, 1, postAlgMono.size)
+                webSocketRef.get()?.send(postAlgFrame.toByteString())
 
                 val inIndex = try {
                     codec.dequeueInputBuffer(10_000)
@@ -391,8 +422,8 @@ class ConnectViewModel(application: Application) : AndroidViewModel(application)
                 if (inIndex >= 0) {
                     val inBuf = codec.getInputBuffer(inIndex) ?: continue
                     inBuf.clear()
-                    inBuf.put(mono, 0, mono.size)
-                    codec.queueInputBuffer(inIndex, 0, mono.size, System.nanoTime() / 1000, 0)
+                    inBuf.put(rawMono, 0, rawMono.size)
+                    codec.queueInputBuffer(inIndex, 0, rawMono.size, System.nanoTime() / 1000, 0)
                 }
             }
         }
@@ -541,6 +572,7 @@ class ConnectViewModel(application: Application) : AndroidViewModel(application)
 
         _connectionState.value = ConnectionState.DISCONNECTED
         _statusMessage.value = "Disconnected"
+        _serverMessage.value = ""
     }
 
     override fun onCleared() {
