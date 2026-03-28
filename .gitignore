@@ -34,3 +34,5 @@ glasses-development/*.aab
 server/intermediate_data/
 server/user_recognition_agent/intermediate_data/
 server/venv/
+server/user_recognition_agent/persons.db
+server/user_recognition_agent/known_faces/
