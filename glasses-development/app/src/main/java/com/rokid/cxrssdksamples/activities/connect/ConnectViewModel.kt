@@ -166,8 +166,31 @@ class ConnectViewModel(application: Application) : AndroidViewModel(application)
                 Log.i(TAG, "Server JSON: $text")
                 try {
                     val json = org.json.JSONObject(text)
-                    if (json.has("message")) {
-                        _serverMessage.value = json.getString("message")
+                    val type = json.optString("type", "")
+                    when (type) {
+                        "recognition" -> {
+                            val person = json.getJSONObject("person")
+                            val name = person.getString("name")
+                            val role = person.optString("role", "")
+                            val confidence = person.optDouble("confidence", 0.0)
+                            val display = if (role.isNotEmpty()) "$name\n$role" else name
+                            _serverMessage.value = display
+                            Log.i(TAG, "Recognized: $name (${(confidence * 100).toInt()}%)")
+                        }
+                        "enrolled" -> {
+                            val person = json.getJSONObject("person")
+                            val name = person.optString("name", "Unknown")
+                            _serverMessage.value = "✓ Enrolled: $name"
+                        }
+                        "error" -> {
+                            _serverMessage.value = json.optString("message", "Error")
+                        }
+                        else -> {
+                            // Fallback: display "message" field if present (backward compat)
+                            if (json.has("message")) {
+                                _serverMessage.value = json.getString("message")
+                            }
+                        }
                     }
                 } catch (e: Exception) {
                     Log.w(TAG, "Failed to parse JSON: ${e.message}")
@@ -220,6 +243,26 @@ class ConnectViewModel(application: Application) : AndroidViewModel(application)
         webSocket?.close(1000, "User disconnected")
         webSocket = null
         teardown()
+    }
+
+    /**
+     * Send an enroll command to the server.
+     * The server will grab the current video frame, extract a face embedding, and store it.
+     */
+    fun sendEnrollCommand(name: String? = null, role: String? = null, funFact: String? = null) {
+        val ws = webSocketRef.get() ?: run {
+            Log.w(TAG, "Cannot enroll: not connected")
+            return
+        }
+        val json = org.json.JSONObject().apply {
+            put("command", "enroll")
+            name?.let { put("name", it) }
+            role?.let { put("role", it) }
+            funFact?.let { put("fun_fact", it) }
+        }
+        ws.send(json.toString())
+        Log.i(TAG, "Sent enroll command: $json")
+        _serverMessage.value = "Enrolling..."
     }
 
     // ---------------------------------------------------------------------------

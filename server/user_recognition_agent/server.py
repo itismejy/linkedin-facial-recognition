@@ -24,6 +24,12 @@ import websockets
 from aiohttp import web
 from dotenv import load_dotenv
 
+import json as json_module
+from .database import init_db, add_person, get_all_persons
+from .recognition import extract_embedding, match_face
+from .decoder import extract_frame_from_h264
+from .transcription import transcribe_and_extract
+
 load_dotenv()
 
 logging.basicConfig(
@@ -123,6 +129,7 @@ FRAME_TYPE_AUDIO = 0x01
 FRAME_TYPE_IMAGE = 0x02
 FRAME_TYPE_VIDEO_H264 = 0x03
 FRAME_TYPE_AUDIO_AAC = 0x04
+FRAME_TYPE_AUDIO_POST_ALG = 0x05  # Post-algorithm PCM (noise-suppressed, ch 0/1)
 
 INTERMEDIATE_DATA_DIR = Path(__file__).resolve().parent / "intermediate_data"
 
@@ -618,6 +625,7 @@ async def bridge(glasses_ws) -> None:
     h264_buffer: list[bytes] = []
     aac_buffer: list[bytes] = []   # AAC ADTS frames from 0x04
     pcm_buffer: list[bytes] = []   # raw PCM from 0x01 (fallback)
+    post_alg_buffer: list[bytes] = []  # post-algorithm PCM from 0x05 (noise-suppressed, for enrollment)
     h264_config: Optional[bytes] = None
     buffer_lock = Lock()
     loop = asyncio.get_event_loop()
@@ -670,62 +678,78 @@ async def bridge(glasses_ws) -> None:
                 log.warning("stream_only save clip failed: %s", e)
 
     first_pcm = first_aac = first_video = True
+
+    # Face recognition state
+    recognition_h264_buffer: list[bytes] = []
+    last_recognition_time = 0.0
+    RECOGNITION_INTERVAL = 2.0  # seconds between recognition attempts
+
     last_stats_time = time.monotonic()
     STATS_INTERVAL = 2.0
 
     save_task: Optional[asyncio.Task] = None
-    sender_task: Optional[asyncio.Task] = None
-    
-    import av
-    import json
-
-    h264_codec = None
     try:
         h264_codec = av.CodecContext.create("h264", "r")
     except Exception as e:
         log.warning("Could not create PyAV H264 codec: %s", e)
 
-    face_rec_codec = None
-    face_rec_codec_ready = False
-
-    last_face_rec_time = 0
-    FACE_REC_INTERVAL_SEC = 2.0
-
-    FUN_FACTS = {
-        "Maryam": "I have snesthesia, i can see colors when hearing naems and numbers.",
-        "Kaleb": "Threw javelin in college.",
-        "Jason": "my favorite movie is interstellar",
-        "jason": "my favorite movie is interstellar"
-    }
-
-    async def process_face_frame(bgr_frame: np.ndarray) -> None:
-        try:
-            names = await loop.run_in_executor(None, run_face_recognition_sync, bgr_frame)
-            if names:
-                known_names = [n for n in names if n != "Unknown"]
-                if known_names:
-                    display_texts = []
-                    for n in known_names:
-                        fact = FUN_FACTS.get(n) or FUN_FACTS.get(n.lower()) or FUN_FACTS.get(n.capitalize())
-                        if fact:
-                            display_texts.append(f"{n} - {fact}")
-                        else:
-                            display_texts.append(n)
-                            
-                    msg = f"Detected: {', '.join(display_texts)}"
-                    payload = {
-                        "type": "face_detection",
-                        "message": msg,
-                        "timestamp": time.time()
-                    }
-                    await glasses_ws.send(json.dumps(payload))
-                    log.info(f"======== FACE RECOGNIZED: {msg} ========")
-        except Exception as e:
-            log.warning("process_face_frame failed: %s", e)
-    try:
-        save_task = asyncio.create_task(save_clip_every_interval())
-
         async for message in glasses_ws:
+            if isinstance(message, str):
+                try:
+                    cmd = json_module.loads(message)
+                    command = cmd.get("command", "")
+
+                    if command == "enroll":
+                        # Grab latest frame and run enrollment
+                        frame = await loop.run_in_executor(
+                            None,
+                            lambda chunks=list(recognition_h264_buffer), cfg=h264_config: extract_frame_from_h264(chunks, cfg)
+                        )
+                        if frame is not None:
+                            embedding = await loop.run_in_executor(
+                                None,
+                                lambda f=frame: extract_embedding(f)
+                            )
+                            if embedding is not None:
+                                # Try auto-extraction from audio first
+                                name = cmd.get("name")
+                                role = cmd.get("role")
+                                fun_fact = cmd.get("fun_fact")
+
+                                if not name and post_alg_buffer:
+                                    # Use noise-suppressed audio for transcription
+                                    try:
+                                        extracted_name, extracted_role, extracted_fact = await transcribe_and_extract(
+                                            list(post_alg_buffer)
+                                        )
+                                        name = extracted_name or name
+                                        role = extracted_role or role
+                                        fun_fact = extracted_fact or fun_fact
+                                    except Exception as e:
+                                        log.warning("Audio extraction failed: %s", e)
+
+                                # Fallback if still no name
+                                if not name:
+                                    name = f"Person_{int(time.time())}"
+                                person_id = add_person(name, embedding, role, fun_fact)
+                                await glasses_ws.send(json_module.dumps({
+                                    "type": "enrolled",
+                                    "person": {"id": person_id, "name": name, "role": role}
+                                }))
+                                log.info("Enrolled person: %s (id=%d)", name, person_id)
+                            else:
+                                await glasses_ws.send(json_module.dumps({
+                                    "type": "error", "message": "No face detected in frame"
+                                }))
+                        else:
+                            await glasses_ws.send(json_module.dumps({
+                                "type": "error", "message": "No video frames available"
+                            }))
+
+                except Exception as e:
+                    log.warning("Failed to handle text command: %s", e)
+                continue
+
             if isinstance(message, bytes) and len(message) >= 1:
                 frame_type = message[0]
                 payload = message[1:]
@@ -741,6 +765,13 @@ async def bridge(glasses_ws) -> None:
                         first_aac = False
                     with buffer_lock:
                         aac_buffer.append(payload)
+                elif frame_type == FRAME_TYPE_AUDIO_POST_ALG:
+                    # Post-algorithm audio (noise-suppressed) — best for speech recognition
+                    post_alg_buffer.append(payload)
+                    # Keep last ~15 seconds of audio (16kHz * 2 bytes * 15s = 480KB)
+                    max_chunks = 240  # ~15s at typical chunk sizes
+                    if len(post_alg_buffer) > max_chunks:
+                        post_alg_buffer[:] = post_alg_buffer[-max_chunks:]
                 elif frame_type == FRAME_TYPE_VIDEO_H264:
                     if first_video:
                         log.info("[stream_only] first 0x03 (video), len=%d (stored as config)", len(payload))
@@ -750,34 +781,49 @@ async def bridge(glasses_ws) -> None:
                             h264_config = payload
                         h264_buffer.append(payload)
 
-                    if KNOWN_FACE_ENCODINGS:
-                        if not face_rec_codec_ready and h264_config is not None:
-                            try:
-                                face_rec_codec = av.CodecContext.create("h264", "r")
-                                for pkt in face_rec_codec.parse(h264_config):
-                                    face_rec_codec.decode(pkt)
-                                face_rec_codec_ready = True
-                                log.info("[face_rec] Codec initialized with SPS/PPS (%d bytes)", len(h264_config))
-                            except Exception as e:
-                                log.warning("[face_rec] Codec init failed: %s", e)
+                    # Buffer for face recognition
+                    recognition_h264_buffer.append(payload)
+                    if len(recognition_h264_buffer) > 20:
+                        recognition_h264_buffer = recognition_h264_buffer[-20:]
 
-                        if face_rec_codec_ready and face_rec_codec is not None:
+                    # Run recognition periodically
+                    now_recog = time.time()
+                    if now_recog - last_recognition_time >= RECOGNITION_INTERVAL:
+                        last_recognition_time = now_recog
+
+                        async def do_recognition(chunks=list(recognition_h264_buffer), cfg=h264_config):
                             try:
-                                for pkt in face_rec_codec.parse(payload):
-                                    for frame in face_rec_codec.decode(pkt):
-                                        now = time.monotonic()
-                                        if now - last_face_rec_time >= FACE_REC_INTERVAL_SEC:
-                                            last_face_rec_time = now
-                                            bgr_img = frame.to_ndarray(format='bgr24')
-                                            bgr_img = cv2.rotate(bgr_img, cv2.ROTATE_90_COUNTERCLOCKWISE)
-                                            INTERMEDIATE_DATA_DIR.mkdir(parents=True, exist_ok=True)
-                                            snap_ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
-                                            snap_path = INTERMEDIATE_DATA_DIR / f"face_frame_{snap_ts}.jpg"
-                                            cv2.imwrite(str(snap_path), bgr_img)
-                                            log.info("[face_rec] Decoded frame %dx%d, saved to %s, running recognition", bgr_img.shape[1], bgr_img.shape[0], snap_path.name)
-                                            asyncio.create_task(process_face_frame(bgr_img))
+                                frame = await loop.run_in_executor(
+                                    None,
+                                    lambda: extract_frame_from_h264(chunks, cfg)
+                                )
+                                if frame is None:
+                                    return
+                                embedding = await loop.run_in_executor(
+                                    None,
+                                    lambda: extract_embedding(frame)
+                                )
+                                if embedding is None:
+                                    return
+                                persons = get_all_persons()
+                                result = match_face(embedding, persons)
+                                if result:
+                                    person, confidence = result
+                                    await glasses_ws.send(json_module.dumps({
+                                        "type": "recognition",
+                                        "matched": True,
+                                        "person": {
+                                            "name": person.name,
+                                            "role": person.role,
+                                            "fun_fact": person.fun_fact,
+                                            "confidence": confidence,
+                                        }
+                                    }))
+                                    log.info("Recognized: %s (%.0f%%)", person.name, confidence * 100)
                             except Exception as e:
-                                log.warning("[face_rec] decode error: %s", e)
+                                log.warning("Recognition failed: %s", e)
+
+                        asyncio.create_task(do_recognition())
                 else:
                     log.debug("[stream_only] unknown frame_type=0x%02x len=%d", frame_type, len(payload))
             now = time.monotonic()
@@ -804,18 +850,13 @@ async def bridge(glasses_ws) -> None:
                 await save_task
             except asyncio.CancelledError:
                 pass
-        if sender_task and not sender_task.done():
-            sender_task.cancel()
-            try:
-                await sender_task
-            except asyncio.CancelledError:
-                pass
         log.info("Glasses disconnected: %s", client_addr)
 
 
 async def main() -> None:
     ensure_only_video_clips_in_intermediate_data()
-    load_known_faces()
+    init_db()
+    log.info("Person database initialized")
     log.info("Starting WebSocket server on ws://%s:%d (user recognition - stream only)", HOST, PORT)
     log.info("Starting HTTP upload server on http://%s:%d/upload_clip", HOST, UPLOAD_PORT)
 

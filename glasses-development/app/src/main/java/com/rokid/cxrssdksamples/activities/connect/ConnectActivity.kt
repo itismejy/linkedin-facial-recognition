@@ -67,6 +67,18 @@ class ConnectActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Tap on the Rokid touch strip triggers enrollment.
+     * Single tap = KEYCODE_ENTER (66) on Rokid Glasses.
+     */
+    override fun onKeyDown(keyCode: Int, event: android.view.KeyEvent?): Boolean {
+        if (keyCode == android.view.KeyEvent.KEYCODE_ENTER) {
+            viewModel.sendEnrollCommand()
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
     private fun handleConnectClick() {
         val needed = listOf(
             Manifest.permission.RECORD_AUDIO,
